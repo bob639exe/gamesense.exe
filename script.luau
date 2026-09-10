@@ -10,6 +10,8 @@ local HttpService = game:GetService("HttpService")
 local environment = getgenv()
 local previous = environment.GameSenseOverlay
 if previous and type(previous.Unload) == "function" then previous.Unload() end
+local legacy = environment.KnifeDuelOverlay
+if legacy and legacy ~= previous and type(legacy.Unload) == "function" then legacy.Unload() end
 
 local lockBinding = "GameSensePlayerLock_" .. HttpService:GenerateGUID(false)
 local overlayBinding = lockBinding .. "_Overlay"
@@ -43,6 +45,13 @@ local drawState = {}
 local overlayElapsed = 0
 local overlayInterval = 1 / 30
 local boundsInterval = 0.2
+local gameFocused = true
+if type(isrbxactive) == "function" then
+    local ok, focused = pcall(isrbxactive)
+    if ok and type(focused) == "boolean" then gameFocused = focused end
+end
+local diagnostics = { overlayTicks = 0, lockTicks = 0, callbacks = 0, error = "none" }
+local drawingHealthy = true
 
 local function trackPlayer(player)
     if player ~= Players.LocalPlayer then trackedPlayers[player] = true end
@@ -86,6 +95,7 @@ local function newDrawing(kind, properties)
     drawState[object] = { Visible = false }
     local ok, err = pcall(function()
         object.Visible = false
+        setDrawing(object, "Transparency", 0.5)
         for key, value in pairs(properties) do setDrawing(object, key, value) end
     end)
     if not ok then removeDrawing(object); error(err, 0) end
@@ -162,7 +172,7 @@ local function updateOverlay()
         return
     end
     local camera = workspace.CurrentCamera
-    local active = camera ~= nil and (type(isrbxactive) ~= "function" or isrbxactive())
+    local active = camera ~= nil and gameFocused
     setDrawing(fovCircle, "Visible", active and showFOV)
     if active and showFOV then
         setDrawing(fovCircle, "Position", camera.ViewportSize / 2)
@@ -296,7 +306,7 @@ local function updateCursorRMB()
     if lockEnabled or not autoRMBEnabled or not clickRMB then return end
     local now = os.clock()
     if now - lastRMBClick < rmbClickInterval then return end
-    if type(isrbxactive) == "function" and not isrbxactive() then return end
+    if not gameFocused then return end
     if UserInputService:GetFocusedTextBox() then return end
     local camera = workspace.CurrentCamera
     if not camera then return end
@@ -311,7 +321,8 @@ local function updateCursorRMB()
     if not part or not part:IsA("BasePart") or part.Transparency >= 1
         or part.LocalTransparencyModifier >= 1 then return end
     local character = part.Parent
-    local player = character and Players:GetPlayerFromCharacter(character)
+    if not character or not character:IsA("Model") then return end
+    local player = Players:GetPlayerFromCharacter(character)
     if not player or player == Players.LocalPlayer then return end
     local humanoid = character:FindFirstChildOfClass("Humanoid")
     if not humanoid or humanoid.Health <= 0 then return end
@@ -340,7 +351,8 @@ local function tryAutoRMB(camera, head, aimPoint, throwOrigin)
 end
 
 local function updatePlayerLock(deltaTime)
-    if type(isrbxactive) == "function" and not isrbxactive() then return end
+    diagnostics.lockTicks = diagnostics.lockTicks + 1
+    if not gameFocused then return end
     local camera = workspace.CurrentCamera
     if not camera then
         return
@@ -383,7 +395,15 @@ local function setPlayerLock(enabled)
     end
     lockEnabled = enabled
     if enabled then
-        RunService:BindToRenderStep(lockBinding, Enum.RenderPriority.Camera.Value + 1, updatePlayerLock)
+        RunService:BindToRenderStep(lockBinding, Enum.RenderPriority.Camera.Value + 1, function(deltaTime)
+            local ok, err = pcall(updatePlayerLock, deltaTime)
+            if not ok then
+                lockEnabled = false
+                RunService:UnbindFromRenderStep(lockBinding)
+                diagnostics.error = "Lock: " .. tostring(err)
+                notice(diagnostics.error)
+            end
+        end)
     else
         RunService:UnbindFromRenderStep(lockBinding)
     end
@@ -494,6 +514,15 @@ function controller.Unload()
     if environment.GameSenseOverlay == controller then environment.GameSenseOverlay = nil end
 end
 environment.GameSenseOverlay = controller
+function controller.Status()
+    local playersCount, boxesCount = 0, 0
+    for _ in pairs(trackedPlayers) do playersCount = playersCount + 1 end
+    for _ in pairs(playerBoxes) do boxesCount = boxesCount + 1 end
+    return string.format("ESP=%s FOV=%s Lock=%s RMB=%s | Focus=%s Camera=%s | Players=%d Boxes=%d | Render=%d LockTicks=%d Controls=%d | Error: %s",
+        tostring(espEnabled), tostring(showFOV), tostring(lockEnabled), tostring(autoRMBEnabled),
+        tostring(gameFocused), tostring(workspace.CurrentCamera ~= nil), playersCount, boxesCount,
+        diagnostics.overlayTicks, diagnostics.lockTicks, diagnostics.callbacks, diagnostics.error)
+end
 
 rebuildMenu = function()
     menuGeneration = menuGeneration + 1
@@ -503,11 +532,19 @@ rebuildMenu = function()
     window = imgui.create("GameSense.exe")
     local function callback(fn)
         return function(...)
-            if running and generation == menuGeneration then fn(...) end
+            if running and generation == menuGeneration then
+                diagnostics.callbacks = diagnostics.callbacks + 1
+                local ok, err = pcall(fn, ...)
+                if not ok then
+                    diagnostics.error = "Control: " .. tostring(err)
+                    notice(diagnostics.error)
+                end
+            end
         end
     end
     window:Text("K: menu | " .. lockKey.Name .. ": lock | End: unload")
     window:Text(noticeText)
+    window:Button("Show status", callback(function() notice(controller.Status()) end))
     window:Separator()
     window:Checkbox("ESP boxes", espEnabled, callback(setESP))
     window:Checkbox("Show FOV", showFOV, callback(function(value) showFOV = value end))
@@ -554,6 +591,8 @@ rebuildMenu = function()
 end
 
 local ok, err = pcall(function()
+    table.insert(connections, UserInputService.WindowFocused:Connect(function() gameFocused = true end))
+    table.insert(connections, UserInputService.WindowFocusReleased:Connect(function() gameFocused = false end))
     table.insert(connections, Players.PlayerAdded:Connect(trackPlayer))
     table.insert(connections, Players.PlayerRemoving:Connect(removePlayer))
     for _, player in ipairs(Players:GetPlayers()) do trackPlayer(player) end
@@ -577,7 +616,7 @@ local ok, err = pcall(function()
         if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
         if input.KeyCode == Enum.KeyCode.End then controller.Unload(); return end
         if processed or UserInputService:GetFocusedTextBox() then return end
-        if type(isrbxactive) == "function" and not isrbxactive() then return end
+        if not gameFocused then return end
         if input.KeyCode == Enum.KeyCode.K then
             menuVisible = not menuVisible
             rebuildMenu()
@@ -589,19 +628,27 @@ local ok, err = pcall(function()
     RunService:BindToRenderStep(overlayBinding, Enum.RenderPriority.Last.Value, function(deltaTime)
         overlayElapsed = overlayElapsed + deltaTime
         if overlayElapsed < overlayInterval then return end
-        -- Do not catch up missed ticks after a hitch.
         overlayElapsed = overlayElapsed % overlayInterval
-        local rendered, renderError = pcall(function()
-            updateOverlay()
-            updateCursorRMB()
-        end)
+        diagnostics.overlayTicks = diagnostics.overlayTicks + 1
+        local rendered, renderError = true, nil
+        if drawingHealthy then rendered, renderError = pcall(updateOverlay) end
         if not rendered then
-            controller.Unload()
-            warn("Knife Duel overlay stopped: " .. tostring(renderError))
+            drawingHealthy = false
+            espEnabled, showFOV = false, false
+            for object in pairs(drawings) do removeDrawing(object) end
+            table.clear(playerBoxes)
+            diagnostics.error = "Drawing: " .. tostring(renderError)
+            notice(diagnostics.error)
+        end
+        local triggered, triggerError = pcall(updateCursorRMB)
+        if not triggered then
+            autoRMBEnabled = false
+            diagnostics.error = "Auto RMB: " .. tostring(triggerError)
+            notice(diagnostics.error)
         end
     end)
 end)
 if not ok then
     controller.Unload()
-    error("Knife Duel startup failed: " .. tostring(err), 0)
+    error("GameSense.exe startup failed: " .. tostring(err), 0)
 end
